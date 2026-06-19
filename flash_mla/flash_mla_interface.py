@@ -461,7 +461,9 @@ def _flash_attn_varlen_forward(
         max_seqlen_kv,
         is_varlen,
         window_size,
-        sink_bias,   # gpt-oss per-head attention sink [h_q] fp32 (in-kernel fold-in); None disables
+        # kernel reads sink as fp32 (const float*); bf16 training stores the sink param
+        # in bf16, so cast here.
+        (sink_bias.float() if sink_bias is not None else None),
     )
 
     return out, lse
@@ -536,7 +538,9 @@ def _flash_attn_varlen_backward(
         max_seqlen_kv,
         is_varlen,
         window_size,
-        sink_bias,
+        # kernel reads sink as fp32 (const float*); bf16 training stores the sink param
+        # in bf16, so cast here. d_sink is fp32 (set above).
+        (sink_bias.float() if sink_bias is not None else None),
         d_sink,
     )
 
@@ -600,6 +604,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         )
         # Forward inputs: q,k,v,cu_qo,cu_kv,max_qo,max_kv,causal,softmax_scale,is_varlen,
         # window_size,sink_bias -> dq,dk,dv + 8 Nones + d_sink.
+        # d_sink comes back fp32; match the sink param's dtype (bf16 in bf16 training) so
+        # autograd accepts the grad for the bf16 sink Parameter.
+        if d_sink is not None and ctx.has_sink:
+            d_sink = d_sink.to(sink_bias.dtype)
         return dq, dk, dv, None, None, None, None, None, None, None, None, d_sink
 
 
