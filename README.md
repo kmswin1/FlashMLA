@@ -1,250 +1,190 @@
-# FlashMLA Sparse Backward
+# FlashMLA — Sparse / SWA / Block-Sparse extensions
 
-Custom CUTLASS-3 SM100 backward kernel for **DeepSeek Sparse Attention (DSA)**
-absorbed-MLA. Runs on **B200 and B300** (Blackwell), designed for the K2-32K
-production training stack.
+A fork of [deepseek-ai/FlashMLA](https://github.com/deepseek-ai/FlashMLA) that adds three
+training/inference kernels on top of the upstream MLA forward/backward, targeting
+**Blackwell (B200/B300, SM100)** with an SM90 (Hopper) decode path:
 
-This repository contains:
-- **Sparse MLA backward kernel** for SM100 — warp-specialized, CUTLASS-3
-- **Slurm scripts** to build and run on a SLURM cluster
-- **Docs** with full design + milestone history
+1. **Sparse MLA backward** — CUTLASS-3 SM100 backward for **DeepSeek Sparse Attention (DSA)**
+   absorbed-MLA (per-token top-k), for the K2-32K production training stack.
+2. **Sliding-Window Attention (SWA)** on **dense MLA** — runtime-configurable causal window
+   on the SM100 prefill (fwd + bwd) and SM90 decode kernels, with a forward tile-skip so a
+   windowed prefill is *faster*, not just masked.
+3. **Block-sparse MLA — forward + KV-outer backward** (192/128, the non-absorbed *training* form).
+   A matched fwd/bwd pair, forked from the dense MLA kernels, where each query-block attends only
+   its selected key-blocks. The **forward** runs up to **~80–90×** and the **backward** up to
+   **~58×** faster than the stock dense MLA at 256K context, with a validated, bitwise-deterministic
+   end-to-end training step. The backward also covers **dense / dense+SWA / block-sparse /
+   block-sparse+SWA** in one kernel.
 
-For the Megatron-LM training stack that uses this kernel (DSA python interface,
-correctness/bench scripts, K2-32K dryrun slurm files), see the companion
-repository: **https://github.com/kmswin1/Megatron-LM**.
+The whole upstream tree (forward, dense + sparse, SM90 + SM100) and CUTLASS are **vendored**
+into `csrc/` (no submodule); everything builds from `setup.py`.
 
-The backward kernel is numerically validated against an autograd reference and
-deployed in production training on Blackwell (B200/B300).
-
-> **Status (2026-05-18)**: dKV mean_abs **0.010** vs reference (16× improvement
-> from initial implementation). dQ max_abs **0.058** at production shape (bf16
-> noise level). Multi-iter (16 K-tiles) production-scale test passes. Production
-> training verify in flight.
+> The kernels are numerically validated against autograd references on B200. The DSA sparse
+> backward is deployed in production K2-32K training on Blackwell.
 
 ---
 
-## Highlights
+## What's added vs upstream
 
-| Metric | Value |
+### 1. Sparse MLA backward (DSA, per-token top-k)
+
+FA3-style backward over per-token sparse top-k indices, D_QK=576 split across 3 cluster CTAs,
+D_V=512 split across 4 chunks. CTA = one Q-token iterating its top-k K-tiles; dK/dV via FP32
+`atomicAdd` scatter into `indices[k]`; dQ via `SM90_TMA_REDUCE_ADD`.
+
+| Metric (production shape T=4096, topk=2048) | Value |
 |---|---|
-| **dKV mean_abs vs ref** (production shape) | **0.010** (bf16 noise floor in dense regions: 0.002) |
-| **dQ max_abs vs ref** (production shape) | **0.058** |
-| **dKV cols 0:128** (dV+dK overlap) mean_abs | **0.002** (fully deterministic with FP32 atomic) |
-| **Kernel iter-time speedup vs TileLang reference** | -78.6% (K2-32K shape, bench) |
-| **Multi-iter scaling** (16 K-tiles) | ✅ |
+| dKV mean_abs vs ref | **0.010** (bf16 noise floor in dense regions 0.002) |
+| dQ max_abs vs ref | 0.058 |
 
-Target hardware: **SM100 / Blackwell (B200, B300)** (SM_100 / SM_103). CUDA 13.0, CUTLASS 3.x.
-SM90 (H100/H800) port is on the roadmap (see `docs/`).
+`flash_mla.flash_mla_sparse_fwd` / `flash_mla.flash_mla_sparse_bwd`. The LSE contract is
+**base-2** on the bwd input (the sparse fwd emits base-e — multiply by `log2(e)`).
+
+### 2. Sliding-Window Attention (SWA) on dense MLA
+
+Runtime `window_size` (causal left window; default semantics `(left, right=0)`) threaded through
+the SM100 dense prefill **fwd + bwd** (MLA 192/128 and generic 128/128) and the SM90 dense decode
+kernel. The mask predicate `(q+offset)-k >= window_size` is applied identically in fwd and bwd so
+gradients stay consistent. The forward **skips K-tiles below the window** (`get_trip_start`), so a
+windowed prefill does less work — ~20× fewer K-tiles at 64K with a 128-wide window.
+
+Exposed via `window_size` on `flash_attn_varlen_func` (tuple `(left, right)`; `right` must be 0).
+Validated fwd+bwd on SM90 + SM100 (`tests/test_swa_correctness.py`, `tests/test_fmha_sm100.py`).
+
+### 3. Block-sparse MLA — forward + KV-outer backward (192/128 training path)
+
+The non-absorbed **192/128** MLA form (per-head K = nope128 + rope64, V = 128) is the *training*
+shape — gradients flow to the latent via W_k/W_v. Both forward and backward are forked from the
+dense MLA kernels so that **each query-block attends only its selected key-blocks** (a
+per-(Q-block→K-block) selection `q2k`), giving **O(s · selected)** compute instead of O(s²). A
+KV-block = `kv_block_size` (128) tokens; a "selection" is a small set of K-blocks per Q-block.
+
+**Forward** — `block_sparse_prefill_fwd`, forked from the dense MLA fwd. The contiguous K-tile loop
+becomes a per-Q-block walk over the selected K-blocks (`q2k`), and **only the diagonal-region tiles
+get the causal mask** (selected blocks fully below the diagonal are all-valid → mask skipped, which
+is what closes the gap to the stock dense kernel). Emits **O + LSE (base-e)** in the dense fwd
+convention so it feeds the matched backward. `q_block = 256` (TileShape Q), `kv_block = 128`.
+
+**Backward** — `block_sparse_prefill_bwd`. The dense MLA bwd is already **KV-outer** (CTA = K-tile,
+iterate Q-tiles, accumulate dK/dV in TMEM, store once; dQ via REDUCE_ADD). The per-token sparse bwd
+had to invert this to Q-outer + atomicAdd scatter (no fixed K→Q map). Block-sparse **restores
+KV-outer** via the `k2q` reverse CSR (K-block → attending Q-blocks): a K-block CTA iterates only the
+Q-blocks that selected it, accumulates dK/dV, stores once — **no scatter, bitwise-deterministic
+dK/dV** (the CSR is sorted per row, `sort_k2q_csr`, for a stable reduction order). `k2q_row_ptr ==
+nullptr` ⇒ dense path, so **one kernel does dense / dense+SWA / block-sparse / block-sparse+SWA**.
+`q_block = 64` (TileShapeQ), `kv_block = 128`. Selection is shared across query heads.
+
+**End-to-end training step.** The fwd (`q_block` 256) and bwd (`q_block` 64) are reconciled with
+`expand_block_selection(q2k, 4)`: a 256-block's selection replicated to its four 64-sub-blocks is the
+*identical* (q,k) attended set, because both kernels mask causally per row.
+
+```python
+o, lse      = block_sparse_prefill_fwd(q, k, v, q2k256, scale)          # 192/128, q_block=256
+q2k64       = expand_block_selection(q2k256, 4)                         # 256 → 64 granularity
+dq, dk, dv  = block_sparse_prefill_bwd(q, k, v, o, do, lse, q2k64,      # q_block=64
+                                       scale, -1, 128, 64)
+```
+
+**Precision** (same numerical scheme as the dense MLA kernels — these are forks): forward O/LSE cos
+**0.999998**, backward dQ/dK/dV cos **0.999997** vs the autograd oracle (full-causal *and* scattered
+selections), with bitwise-deterministic dK/dV across runs. (The per-token sparse bwd's atomicAdd
+scatter, by contrast, is non-deterministic with dKV cos ~0.983.)
 
 ---
 
-## Repository layout
+## Benchmarks (B200, 192/128 MLA)
 
-```
-FlashMLA-bwd/
-├── README.md                                    # this file
-├── LICENSE
-├── patches/                                     # FlashMLA-side patches (overlay onto upstream)
-│   ├── setup.py                                 # registers the sparse_bwd TU
-│   ├── flash_mla/
-│   │   ├── __init__.py                          # exports flash_mla_sparse_bwd
-│   │   └── flash_mla_interface.py
-│   └── csrc/
-│       ├── api/
-│       │   ├── api.cpp                          # PyBind11 entry
-│       │   └── sparse_bwd.h                     # dispatch + arg validation
-│       ├── kerutils/include/kerutils/device/sm100/
-│       │   └── intrinsics.cuh                   # +tma_gather4_cta_group_1_pipe()
-│       └── sm100/prefill/sparse/bwd/            # ★ main sparse bwd implementation
-│           ├── params.h                         # SparseAttnBwdParams shared struct
-│           ├── sum_OdO.cuh                      # FA3-style D-row precompute
-│           ├── config.h                         # TileShape, ClusterShape constants
-│           ├── sparse_bwd_kernel.hpp            # Load/MMA/Compute/Reduce warps
-│           ├── sparse_bwd_host.cuh              # host wrapper + TMA descriptor builders
-│           └── instantiations/
-│               └── sparse_bwd_k576.cu           # k=576 instantiation
-├── slurm/
-│   ├── build_flashmla.sh                        # build inside container
-│   ├── correctness.sh                           # numerical correctness check
-│   └── k2.dry.dsa.flashmla.bwd.sh                # K2-32K 8-node dryrun w/ sparse bwd enabled
-└── docs/
-    ├── SPARSE_BWD_DESIGN.md                     # full design notes + remaining gaps
-    ├── SPARSE_BWD_HISTORY.md                    # M16 milestone history
-    ├── M13_indexer_bwd.md                       # parallel track: indexer_bwd block_I=128
-    └── dsa_grid_constant_required_for_tma.md   # __grid_constant__ requirement
-```
+**Setup.** Same inputs (q,k,v, causal). **dense** = stock FlashMLA dense MLA kernel (the kIsMla
+192/128 path); **block-sparse** = the kernels above, selection = global sink + 4-block window
+(~5 selected K-blocks ≈ 640 keys, *constant* in seqlen). Dense is O(s²), block-sparse O(s · selected),
+so the speedup grows with context — it is essentially the **sparsity ratio**. Running the block-sparse
+kernel with a *full-causal* selection reproduces the stock dense time to ±1%, confirming the gain is
+the sparsity, not a kernel artifact.
 
-The repository is structured as **patches** that overlay onto upstream FlashMLA.
-The current main kernel **does not bundle a copy of upstream FlashMLA**; you must
-clone it separately (or via submodule — see [Submodule mode](#submodule-mode)).
+**Forward** (`tests/bench_block_sparse_fwd_vs_dense.py`, h=8):
 
----
+| seqlen | dense (stock, ms) | block-sparse (ms) | speedup |
+|---|---|---|---|
+| 16384 | 0.56 | 0.13 | ~4× |
+| 65536 | 9.0 | 0.48 | ~19× |
+| 131072 | 35.9 | 0.92 | ~39× |
+| 262144 | 144 | ~1.7 | **~80–90×** |
 
-## Architecture overview
+**Backward** (`tests/bench_block_sparse_bwd_scale.py`, h=16):
 
-The kernel implements FA3-style backward over sparse top-k indices, with full
-D_QK split across 3 cluster CTAs and D_V split across 4 chunks per K-tile:
+| seqlen | dense (stock, ms) | block-sparse (ms) | speedup |
+|---|---|---|---|
+| 16384 | 4.09 | 1.26 | 3.2× |
+| 65536 | 69.0 | 4.82 | 14.3× |
+| 131072 | 273.6 | 9.42 | 29.1× |
+| 262144 | 1093.8 | **18.7** | **58.4×** |
 
-```
-dP    = dO @ V^T                             (per-iter)
-dS    = P * (dP - sum(O*dO))                 (P from softmax with base-2 LSE)
-dQ   += dS @ K                               (TMA REDUCE_ADD into FP32 acc; cast at end)
-dK_c  = dS^T @ Q_c                           (per-CTA d_qk slice; FP32 atomicAdd scatter)
-dV_c  = P^T @ dO_c    for c in 0..3          (per-chunk d_v slice; FP32 atomicAdd scatter)
-```
+> The forward gets nearer the raw sparsity ratio than the backward because the backward carries fixed
+> costs that don't scale down (the `sum_OdO` precompute, bf16↔fp32 convert, the dQ `REDUCE_ADD`). The
+> speedup reflects a *sparse* pattern (different output from dense); its value is contingent on a
+> trained block-indexer picking the important K-blocks — the benchmark uses a fixed sink+window
+> pattern to show the **scaling behavior**, not a claim that every workload sees ~80×.
 
-Warp specialization (16 warps per CTA):
-- **Load** (1 warp): TMA gather4 for K/V, TMA copy for Q/dO/LSE/sum_OdO
-- **MMA** (1 warp): SM100 UMMA-async pipeline; 5 GEMMs per K-tile iter
-- **Compute** (8 warps): softmax, dS, per-iter dK/dV scatter via FP32 atomicAdd
-- **Reduce** (4 warps): TMEM → FP32 dq_acc gmem via SM90_TMA_REDUCE_ADD
-- +2 empty warps for round-up to 16
-
-### Sparse-specific design
-
-The kernel was forked from FlashMLA's dense MLA backward. Major sparse
-adaptations:
-
-1. **K/V gather** via `ku::tma_gather4_cta_group_1_pipe` (a new variant added to
-   kerutils — see `patches/csrc/kerutils/.../intrinsics.cuh`). Col-tile-major
-   SMEM offset matching SW128 atom layout.
-2. **D_QK 3-way CTA partition**: cluster<1,1,1> + grid<3·s_q,1,1>; each CTA owns
-   a 192-col slice of D_QK=576. Q TMA load uses `blockIdx.x % 3` as d_qk tile.
-3. **D_V multi-chunk dV scatter**: 4 chunks × 128 cols/each per K-tile iter.
-   Load issues 4 dO chunks per iter (re-using the same SMEM slot with kStages=1);
-   MMA does 4 dV gemms (Zero accumulator each); Compute scatters with col offset
-   `chunk * 128`.
-4. **Inverted iter semantics**: each CTA processes one Q-token and iterates over
-   K-tiles (vs dense, where each CTA = one K-tile iterating over Q-tiles). This
-   requires per-iter dKV scatter rather than dense's accumulate-then-store
-   pattern.
-5. **FP32 dKV accumulator**: host allocates FP32 scratch buffer; kernel uses
-   `atomicAdd(float*, float)` rather than bf16 atomics. Post-kernel cast to bf16.
-   This gives deterministic accumulation in dense regions (dV+dK overlap at
-   cols 0:128) and higher per-op precision in others.
-6. **Per-iter dKV scatter**: replaces dense's contiguous TMA store with
-   `atomicAdd` to `dKV_acc[indices[k_local], 0, d_local]`. Multiple Q-tokens
-   that select the same K-row sum via atomic.
-
-### Known limitations
-
-- **dP single-chunk**: V is loaded only at d_v[0:128] for the dP MMA (the dV
-  scatter has full d_v coverage). This results in dQ residual ~0.058 max_abs at
-  production shape (~1.16× the test threshold of 0.05). Fully fixing requires
-  V multi-chunk + dP accumulate, which hit a pipeline deadlock during initial
-  attempt; see `docs/SPARSE_BWD_DESIGN.md` for details.
-- **Atomic ordering non-determinism in dK-only regions**: cols 128:575 vary
-  ~3× between runs due to float atomicAdd order-dependence. cols 0:128 are
-  deterministic. For training, this is bias-free noise; same-step run-to-run
-  noise has no impact on convergence.
-- **SM100 only**: no SM90 (H100/H800) backend yet.
+**Aside — inference fwd, block-sparse vs per-token DSA** (`tests/bench_block_vs_pertoken_fwd.py`,
+absorbed 576/512 h=64, both topk=2048): identical (same key count, gather locality negligible), and
+the sparse forward has **no 2^16 limit** (scales to 1M: 409 vs 418 ms at 1M). So for *inference*
+serving the existing per-token sparse fwd already serves block-sparse at full speed — block-sparse's
+value is the **training** fwd/bwd above plus cheaper block-level index selection.
 
 ---
 
-## How to use
+## Layout
 
-### Patches mode (apply onto upstream FlashMLA)
+```
+FlashMLA/
+├── setup.py                        # builds the whole vendored tree (sm90 + sm100)
+├── flash_mla/                      # python API (block_sparse_prefill_{fwd,bwd}, expand_block_selection, ...)
+├── csrc/
+│   ├── cutlass/                    # vendored CUTLASS 3.x
+│   ├── api/api.cpp                 # PyBind11 entry (registers all kernels)
+│   ├── sm90/                       # Hopper decode (incl. SWA lower-border mask)
+│   └── sm100/prefill/
+│       ├── dense/                  # dense MLA fwd+bwd (+ SWA window_size + fwd tile-skip)
+│       └── sparse/
+│           ├── fwd/  bwd/          # per-token DSA sparse fwd + bwd
+│           └── block_bwd/          # ★ block-sparse 192/128 fwd + KV-outer bwd
+│               ├── k2q_csr.cuh                     # q2k → k2q reverse CSR builder (+ sort)
+│               ├── block_sparse_fwd_192_load.hpp     # forked fwd load (q2k K-block walk)
+│               ├── block_sparse_fwd_192_mainloop.hpp # forked fwd mainloop (diagonal-only mask)
+│               ├── block_sparse_fwd_192_pybind.cu    # api entry (block_sparse_prefill_fwd)
+│               ├── block_sparse_bwd_kernel.hpp       # forked dense MLA bwd, CSR-driven
+│               ├── block_sparse_bwd_host.cuh         # bwd device wrapper (CSR + sum_OdO + convert)
+│               ├── block_sparse_bwd_pybind.cu        # api entry (block_sparse_prefill_bwd)
+│               └── block_sparse_bwd_simple.cu        # plain-CUDA reference / determinism oracle
+├── tests/                          # correctness + benches (see below)
+├── benchmark/  slurm/  docs/
+```
+
+Key tests: `test_swa_correctness.py`, `test_fmha_sm100.py` (SWA); `test_block_sparse_fwd_192.py` /
+`test_block_sparse_fwd_192_integrated.py` (block-sparse fwd), `test_block_sparse_bwd_cutlass.py` /
+`test_block_sparse_integrated.py` (KV-outer bwd), `test_block_sparse_e2e.py` (fwd→bwd training step),
+`ref_block_sparse_mla.py` (oracle).
+
+---
+
+## Build
+
+Blackwell (SM100), CUDA 13.0, CUTLASS 3.x. On CUDA 13 the CCCL headers moved, so export the `cccl`
+include before building:
 
 ```bash
-# 1. Clone upstream FlashMLA and this repo
-git clone https://github.com/deepseek-ai/FlashMLA.git
-git clone https://github.com/kmswin1/FlashMLA-bwd.git
-
-# 2. Overlay the patches onto your FlashMLA checkout
-cp -r FlashMLA-bwd/patches/. FlashMLA/
-
-# 3. Build (inside an OFI+DSA container; the script handles CCCL include paths)
-sbatch FlashMLA-bwd/slurm/build_flashmla.sh
+export NVCC_THREADS=16
+export TORCH_CUDA_ARCH_LIST="9.0;10.0"          # sm90 decode + sm100 prefill
+CCCL=/usr/local/cuda/targets/x86_64-linux/include/cccl
+export NVCC_PREPEND_FLAGS="-I$CCCL" CFLAGS="-I$CCCL" CXXFLAGS="-I$CCCL"
+pip install --no-build-isolation -e .
 ```
 
-For Megatron-LM integration (DSA python interface, correctness test, bench
-scripts, K2-32K dryrun), use the companion fork:
-**https://github.com/kmswin1/Megatron-LM**
-
-The Megatron fork pulls in this kernel at container-build time via the
-`Dockerfile.dsa.flashmla_deepgemm` overlay (both AWS and non-AWS variants).
-
-### Submodule mode
-
-To bundle upstream FlashMLA as a git submodule, add it to this repo (the
-submodule lives at `upstream/` by convention):
-
-```bash
-cd FlashMLA-bwd
-git submodule add https://github.com/deepseek-ai/FlashMLA.git upstream
-git submodule update --init --recursive
-```
-
-The Dockerfiles in the consuming repos (see Megatron-LM `docker/Dockerfile.dsa.flashmla_deepgemm`) clone upstream FlashMLA + this repo and apply the overlay at image-build time, so no submodule is strictly required for production builds.
-
-### Correctness check
-
-```bash
-cd /path/to/Megatron-LM
-sbatch /path/to/FlashMLA-bwd/slurm/correctness.sh
-```
-
-Expected output at the production shape (T=4096, topk=2048, 16 K-tile iters):
-
-```
-dQ:  max_abs=5.80e-02  mean_abs=4.31e-04
-dKV: max_abs=7.11e+00  mean_abs=9.91e-03
-  [peek cols 0:128]   mean_abs=1.98e-03  max_abs=3.13e-01
-  [peek cols 128:192] mean_abs=1.76e-02  max_abs=6.02e+00
-  [peek cols 192:512] mean_abs=1.33e-02  max_abs=7.11e+00
-  [peek cols 512:576] mean_abs=1.38e-03  max_abs=2.32e-01
-```
-
-The peek slices the dKV output by d_qk column range so you can compare per-region
-behavior (dV+dK overlap at cols 0:128 vs dK-only at cols 128+).
-
-### K2-32K production dryrun
-
-```bash
-sbatch /path/to/FlashMLA-bwd/slurm/k2.dry.dsa.flashmla.bwd.sh
-```
-
-Runs 5 training iterations across 8 nodes (CP=2, PP=4, EP=8) with the sparse
-backward enabled. Compare loss curve and iter time against the baseline (`MEGATRON_DSA_USE_FLASHMLA_BWD` unset).
+Ready SLURM jobs (container build + verify): `slurm/build_block_sparse.sh` (bwd) and
+`slurm/build_block_sparse_fwd192_integrated.sh` (full build + fwd/bwd correctness + benches + e2e).
 
 ---
-
-## Environment variables
-
-| Variable | Default | Effect |
-|---|---|---|
-| `MEGATRON_DSA_USE_FLASHMLA` | 0 | Use FlashMLA sparse forward (replaces TileLang fwd) |
-| `MEGATRON_DSA_USE_FLASHMLA_BWD` | 0 | Use FlashMLA sparse backward (this kernel) |
-| `MEGATRON_DSA_USE_FLASHMLA_BWD_FUSED_REDUCESUM` | 1 if `_BWD=1` else 0 | Fuse the topk-reducesum (kl_target store) into bwd (M17, partial) |
-| `MEGATRON_DSA_INDEXER_BWD_BLOCK_I` | 32 | M13: setting 128 saves ~15% indexer-bwd time |
-| `CUDA_LAUNCH_BLOCKING` | 0 | Set to 1 for debugging |
-
-Production setup:
-```bash
-export MEGATRON_DSA_USE_FLASHMLA=1
-export MEGATRON_DSA_USE_FLASHMLA_BWD=1
-export MEGATRON_DSA_INDEXER_BWD_BLOCK_I=128
-```
-
----
-
-## Roadmap
-
-- **Production training verify**: 5-step loss curve + iter time at K2-32K vs baseline
-- **dQ residual fix**: V multi-chunk + dP accumulate (deferred due to pipeline deadlock; see design doc)
-- **TMA REDUCE_ADD_2D scatter**: replace atomicAdd with hardware-deterministic reduce (~10× throughput)
-- **M17 fused topk-reducesum**: write kl_target inside the bwd epilogue, save one extra kernel pass
-- **SM90 port**: H100/H800 support (estimated 5-10 person-days)
-
----
-
-## Hardware tested
-
-- **B200** (SM_100) and **B300 SXM6** (SM_103). CUDA 13.0, CUTLASS 3.x, PyTorch 2.10.
-- Untested on H100/H200/H800 (SM_90 port pending).
 
 ## License
 
-See [LICENSE](LICENSE).
-
-Forked work built on top of [FlashMLA](https://github.com/deepseek-ai/FlashMLA) (deepseek-ai).
+See [LICENSE](LICENSE). Built on [FlashMLA](https://github.com/deepseek-ai/FlashMLA) (deepseek-ai).

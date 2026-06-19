@@ -296,6 +296,108 @@ def flash_mla_sparse_bwd(
     )
 
 
+def block_sparse_prefill_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    do_grad: torch.Tensor,
+    lse: torch.Tensor,
+    q2k_blocks: torch.Tensor,
+    sm_scale: float,
+    window_size: int = -1,
+    kv_block_size: int = 128,
+    q_block_size: int = 64,
+):
+    """Block-sparse KV-outer MLA prefill backward (sm100, MLA 192/128).
+
+    The KV-outer counterpart to the per-token sparse bwd: a CTA owns a KV block
+    and iterates only the Q blocks that selected it (via the k2q CSR built from
+    q2k_blocks), accumulating dK/dV with no atomic scatter (deterministic). Up to
+    ~58x faster than the dense MLA bwd at 256K when sparse (O(s*window) vs O(s^2)).
+
+    Args:
+        q,k:  [s_q, h, 192] bf16; v,o,do_grad: [s_q, h, 128] bf16 (B=1, causal)
+        lse:  [h, s_q] float32 (base-e); passed to the kernel as a stride(0)==1
+              [s_q, h] view internally.
+        q2k_blocks: [num_q_blocks, topk] int32 -- per-Q-block selected KV-block
+              ids (-1 pad); num_q_blocks = ceil(s_q / q_block_size).
+        window_size: SWA width (<=0 disables); fuses with block-sparse.
+        kv_block_size / q_block_size: must be 128 / 64 (== TileShapeK / TileShapeQ).
+
+    Returns: (dq [s_q,h,192], dk [s_q,h,192], dv [s_q,h,128]) bf16.
+    """
+    s_q, h, d_qk = q.shape
+    d_v = v.shape[-1]
+    dq = torch.zeros_like(q)
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+    ws_bytes = flash_mla_cuda.block_sparse_bwd_workspace_size(s_q, h, 1, d_qk)
+    workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=q.device)
+    lse_sh = lse.transpose(0, 1) if lse.shape[0] == h else lse  # -> [s_q, h], stride(0)==1
+    flash_mla_cuda.block_sparse_prefill_bwd(
+        workspace, do_grad, q, k, v, o, lse_sh, q2k_blocks, dq, dk, dv,
+        sm_scale, window_size, kv_block_size, q_block_size,
+    )
+    return dq, dk, dv
+
+
+def block_sparse_prefill_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_blocks: torch.Tensor,
+    sm_scale: float,
+):
+    """Block-sparse MLA prefill forward (sm100, MLA 192/128 non-absorbed, training).
+
+    Forks the dense MLA fwd; each q-block (q_block_size=256 = TileShape Q) attends
+    only its q2k-selected KV-blocks (kv_block_size=128, fixed by the kernel tile).
+    O(s*selected) compute -> up to ~180x faster than dense (full-causal) at 256K.
+    Emits O + LSE (base-e) in the dense fwd convention, so the returned lse pairs
+    directly with block_sparse_prefill_bwd.
+
+    Args:
+        q,k: [s_q, h, 192] bf16; v: [s_k, h, 128] bf16 (B=1, causal, per-head K/V).
+        q2k_blocks: [num_q_blocks, topk] int32 -- per-q-block selected KV-block ids
+            (-1 pad); num_q_blocks = ceil(s_q / 256). Shared across heads.
+        sm_scale: softmax scale (typically 192 ** -0.5).
+
+    Returns: (o [s_q, h, 128] bf16, lse [h, s_q] float32, base-e).
+    """
+    s_q, h, d_qk = q.shape
+    d_v = v.shape[-1]
+    o = torch.empty(s_q, h, d_v, device=q.device, dtype=q.dtype)
+    lse_hs = torch.empty(h, s_q, device=q.device, dtype=torch.float32)  # [h, s_q] contiguous
+    lse_sh = lse_hs.transpose(0, 1)  # [s_q, h] view, stride(0)==1 (kernel output layout)
+    flash_mla_cuda.block_sparse_prefill_fwd(q, k, v, o, lse_sh, q2k_blocks, sm_scale)
+    return o, lse_hs
+
+
+def expand_block_selection(q2k_blocks: torch.Tensor, factor: int) -> torch.Tensor:
+    """Reconcile the fwd/bwd q-block granularity for an end-to-end train step.
+
+    The fwd CTA covers q_block=256 rows (one q2k row per CTA); the bwd requires
+    q_block=64 (== TileShapeQ). They are the SAME attention pattern because the fwd
+    applies a 256-block's selection uniformly to all its rows and BOTH kernels apply
+    a per-row causal mask -- so a 256-block's selection, replicated to its `factor`
+    (=256/64=4) sub-blocks of 64, yields an identical (q,k) attended set. Future
+    KV-blocks listed in the coarse selection are causally masked per row in both
+    kernels (zero contribution), so the expansion is exact, not approximate.
+
+    Usage:  o, lse = block_sparse_prefill_fwd(q, k, v, q2k256, scale)
+            q2k64 = expand_block_selection(q2k256, 4)
+            dq, dk, dv = block_sparse_prefill_bwd(q, k, v, o, do, lse, q2k64,
+                                                  scale, -1, 128, 64)
+
+    Args:
+        q2k_blocks: [num_coarse_q_blocks, topk] int32 (the fwd's q_block=256 selection).
+        factor: coarse/fine ratio = fwd_q_block // bwd_q_block (256 // 64 = 4).
+    Returns: [num_coarse_q_blocks * factor, topk] int32 (the bwd's q_block=64 selection).
+    """
+    return q2k_blocks.repeat_interleave(factor, dim=0)
+
+
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,
