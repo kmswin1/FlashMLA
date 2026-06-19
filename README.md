@@ -51,6 +51,17 @@ windowed prefill does less work — ~20× fewer K-tiles at 64K with a 128-wide w
 Exposed via `window_size` on `flash_attn_varlen_func` (tuple `(left, right)`; `right` must be 0).
 Validated fwd+bwd on SM90 + SM100 (`tests/test_swa_correctness.py`, `tests/test_fmha_sm100.py`).
 
+**Attention sink (gpt-oss style).** A per-head learnable scalar logit (`sink_bias`, `[h_q]`) added to
+the softmax denominator only (a value-less virtual key) — for SWA layers (cf. MiMo
+`add_swa_attention_sink_bias`). Implemented **entirely in-kernel, zero extra cost**: the dense-MLA fwd
+folds it into the softmax denominator (`row_sum += exp(sink − scale·row_max)` at finalization → O and
+LSE are sink-aware, no extra pass), and the backward's `d(sink)` is folded into the existing `sum_OdO`
+preprocessing (`d_sink[h] = −Σ_q exp(sink−lse_q)·(O·dO)_q`, no extra launch). No torch/Triton post-pass.
+Pass `sink_bias=nn.Parameter(torch.zeros(h_q))` to `flash_attn_varlen_func`; `backward()` populates its
+grad automatically. Inference reuses it via `attn_sink=` on `flash_mla_with_kvcache`. Validated vs a
+gpt-oss reference: O/LSE/dQ/dK/dV/d_sink cos ≥ 0.99999 (`tests/test_attention_sink.py`); sink overhead
+~0% (`tests/bench_attention_sink_ablation.py`).
+
 ### 3. Block-sparse MLA — forward + KV-outer backward (192/128 training path)
 
 The non-absorbed **192/128** MLA form (per-head K = nope128 + rope64, V = 128) is the *training*

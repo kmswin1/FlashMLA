@@ -206,7 +206,7 @@ struct FwdRunner {
                      const cutlass::KernelHardwareInfo &hw_info, float scale_softmax,
                      void *q_ptr, void *k_ptr, void *v_ptr, void *o_ptr, void *lse_ptr,
                      void *cumulative_length_q, void *cumulative_length_kv,
-                     int window_size = -1) {
+                     int window_size = -1, const float *sink_ptr = nullptr) {
     auto problem_shape_ = problem_shape;
 
     typename Operation::Arguments arguments{
@@ -220,6 +220,11 @@ struct FwdRunner {
     // SWA: causal sliding-window width (<=0 disables). Set via member name so we
     // don't depend on the positional order of the mainloop scale fields.
     arguments.mainloop.window_size = window_size;
+    // gpt-oss attention sink: per-head [h_q] logit folded into the softmax denom in-kernel.
+    // MLA-only (the FMHA 128/128 mainloop Arguments has no sink_bias field).
+    if constexpr (kIsMla) {
+      arguments.mainloop.sink_bias = sink_ptr;
+    }
 
     return arguments;
   }
@@ -229,7 +234,7 @@ struct FwdRunner {
            at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor lse, float scale_softmax,
            at::Tensor workspace, at::Tensor cumulative_seqlen_q,
            at::Tensor cumulative_seqlen_kv, int max_seqlen_q, int max_seqlen_kv,
-           int window_size = -1) {
+           int window_size = -1, const float *sink_ptr = nullptr) {
 
     int total_seqlen_q = q.size(0);
     int total_seqlen_kv = k.size(0);
@@ -274,7 +279,7 @@ struct FwdRunner {
         get_arguments(problem_shape, hw_info, scale_softmax, q.data_ptr(), k.data_ptr(),
                       v.data_ptr(), o.data_ptr(), lse.data_ptr(),
                       cumulative_seqlen_q.data_ptr(), cumulative_seqlen_kv.data_ptr(),
-                      window_size);
+                      window_size, sink_ptr);
 
     Operation op;
 
@@ -295,7 +300,7 @@ template <class DTypeIn, class DTypeOut, bool kIsVarlen, bool kIsMla, class Acti
 void run_fmha_fwd(at::Tensor workspace, at::Tensor q, at::Tensor k, at::Tensor v,
                   at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv, at::Tensor o,
                   at::Tensor lse, float scale_softmax, int max_seqlen_q, int max_seqlen_kv,
-                  int window_size = -1) {
+                  int window_size = -1, const float *sink_ptr = nullptr) {
 
   const at::cuda::CUDAGuard device_guard{(char)q.get_device()};
   const int device_id = q.get_device();
@@ -334,10 +339,10 @@ void run_fmha_fwd(at::Tensor workspace, at::Tensor q, at::Tensor k, at::Tensor v
       (std::is_same_v<ActiveMask, CausalMask<false>> || std::is_same_v<ActiveMask, CausalMask<true>>)) {
     FwdRunner<kIsMla, true, kIsVarlen, DTypeIn, DTypeOut, ActiveMask, KernelOptions...> runner;
     runner.run(options, hw_info, q, k, v, o, lse, scale_softmax, workspace, cumulative_seqlen_q,
-               cumulative_seqlen_kv, max_seqlen_q, max_seqlen_kv, window_size);
+               cumulative_seqlen_kv, max_seqlen_q, max_seqlen_kv, window_size, sink_ptr);
   } else {
     FwdRunner<kIsMla, false, kIsVarlen, DTypeIn, DTypeOut, ActiveMask, KernelOptions...> runner;
     runner.run(options, hw_info, q, k, v, o, lse, scale_softmax, workspace, cumulative_seqlen_q,
-               cumulative_seqlen_kv, max_seqlen_q, max_seqlen_kv, window_size);
+               cumulative_seqlen_kv, max_seqlen_q, max_seqlen_kv, window_size, sink_ptr);
   }
 }
