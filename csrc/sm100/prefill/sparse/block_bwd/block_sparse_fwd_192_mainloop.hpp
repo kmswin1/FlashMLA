@@ -37,10 +37,10 @@
 #include "cute/tensor.hpp"
 #include "cute/layout.hpp"
 
-#include "../collective/fmha_common.hpp"
-#include "../collective/fmha_fusion.hpp"
-#include "../collective/sm100_fmha_mla_load_tma_warpspecialized.hpp"
-#include "../common/pipeline_mla.hpp"
+#include "../../dense/collective/fmha_common.hpp"
+#include "../../dense/collective/fmha_fusion.hpp"
+#include "block_sparse_fwd_192_load.hpp"
+#include "../../dense/common/pipeline_mla.hpp"
 
 namespace cutlass::fmha::collective {
 
@@ -62,7 +62,7 @@ template<
   class ThreadShape = Shape<_2, _1, _1>,
   class OrderLoadEpilogue = cute::false_type
 >
-struct Sm100MlaFwdMainloopTmaWarpspecialized {
+struct Sm100BlockSparseFwdMainloopTmaWarpspecialized {
 
   using Element = Element_;
   using ElementQK = ElementQK_;
@@ -195,7 +195,7 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
   static constexpr int TransactionBytesLoadK = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>);
   static constexpr int TransactionBytesLoadV = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>);
 
-  using Load = Sm100MlaFwdLoadTmaWarpspecialized<
+  using Load = Sm100BlockSparseFwdLoadTmaWarpspecialized<
     Element, StrideQ, StrideK, StrideV,
     CollectiveMmaQK, CollectiveMmaPV,
     SmemLayoutQ, SmemLayoutK, SmemLayoutV,
@@ -219,10 +219,6 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
     // SWA: causal sliding-window width. <=0 disables (plain causal). When >0,
     // each query attends only to the last `window_size` keys (q-W < k <= q).
     int window_size = -1;
-
-    // gpt-oss attention sink: per-head [h_q] learnable logit folded into the softmax
-    // denominator (value-less). nullptr disables. Makes O + LSE sink-aware in-kernel.
-    const float* sink_bias = nullptr;
   };
 
   struct Params {
@@ -234,7 +230,6 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
     float scale_output;
 
     int window_size;
-    const float* sink_bias;
   };
 
   template<class ProblemShape>
@@ -259,14 +254,30 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
         args.scale_q * args.scale_k * scale_softmax,
         args.scale_q * args.scale_k * log2_e * scale_softmax,
         args.scale_v * args.inv_scale_o,
-        args.window_size,
-        args.sink_bias
+        args.window_size
     };
   }
 
   CUTLASS_DEVICE
   static void prefetch_tma_descriptors(Params const& params) {
       Load::prefetch_tma_descriptors(params.load);
+  }
+
+  // block-sparse: number of selected K-blocks for this CTA's q-block (returns -1 => dense,
+  // i.e. fall back to the contiguous causal trip count). bs_base(...)[it] (it in [0,num)) =
+  // global K-tile id of the it-th selected block. q_block = get<0>(blk_coord) since
+  // TileShape Q = q_block_size (one q2k selection per CTA, shared by both half-tile stages).
+  template<class BlkCoord>
+  CUTLASS_DEVICE static int bs_num_sel(Params const& params, BlkCoord const& blk_coord) {
+    if (params.load.ptr_q2k == nullptr) return -1;
+    const int* base = params.load.ptr_q2k + get<0>(blk_coord) * params.load.topk;
+    int n = 0;
+    for (int i = 0; i < params.load.topk; ++i) { if (base[i] >= 0) ++n; else break; }
+    return n;
+  }
+  template<class BlkCoord>
+  CUTLASS_DEVICE static const int* bs_base(Params const& params, BlkCoord const& blk_coord) {
+    return params.load.ptr_q2k + get<0>(blk_coord) * params.load.topk;
   }
 
   template<class BlkCoord, class ProblemShape, class ParamsProblemShape>
@@ -303,9 +314,11 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
     // SWA safe-baseline: window_size is passed through but get_trip_count keeps
     // the full causal count (no leading-tile skip); apply_mask zeros out-of-window
     // keys. mma/softmax/correction/load all use the same count -> pipelines stay
-    // in lockstep.
-    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size)
-                        - Mask{}.get_trip_start(blk_coord, TileShape{}, problem_shape, params.window_size);
+    // in lockstep. block-sparse: the count is the number of selected K-blocks.
+    int bs_sel = bs_num_sel(params, blk_coord);
+    int mask_tile_count = (bs_sel >= 0) ? bs_sel
+                        : Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size)
+                          - Mask{}.get_trip_start(blk_coord, TileShape{}, problem_shape, params.window_size);
 
     typename CollectiveMmaQK::TiledMma mma_qk;
     ThrMMA thr_mma_qk = mma_qk.get_slice(0);
@@ -742,18 +755,6 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
       // re-acquire the S part in the final step
       pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
-      // gpt-oss attention sink: fold a per-head value-less logit into the denominator.
-      // row_sum = sum exp(scale_softmax*(S - row_max)); O-scale = scale_output/row_sum and
-      // LSE = log(row_sum) + scale_softmax*row_max (see correction_epilogue), so adding
-      // exp(sink - scale_softmax*row_max) here makes both O and LSE sink-aware. row_max is
-      // finite for any attended (causal) row; masked-only rows are not used.
-      if (params.sink_bias != nullptr && row_max != -INFINITY) {
-        // flat q-head index = crd2idx of the head coord (h_r,h_k); get<2,1> is batch (cf.
-        // the LSE write). For per-head MLA training (h_r=1) this is just the kv-head index.
-        int head = crd2idx(get<2,0>(blk_coord), get<3,0>(problem_shape));
-        row_sum += ::expf(params.sink_bias[head] - params.scale_softmax * row_max);
-      }
-
       Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
       tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;
       tTMEM_STOREVrS(kIdxFinalRowSum) = row_sum;
@@ -776,30 +777,49 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
     // window active get_masked_trip_count == get_trip_count, so masked == total
     // after the shift -> apply_mask runs on every kept tile (window edge + diagonal).
     const int swa_trip_start = Mask{}.get_trip_start(blk_coord, TileShape{}, problem_shape, params.window_size);
-    const int mask_trip_count = Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size) - swa_trip_start;
-    const int total_trip_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size) - swa_trip_start;
+    // block-sparse: iterate this q-block's selected K-blocks; the cS k-coordinate per
+    // iter is the SELECTED block's global position (sel_iter*TileShapeQK_k) so apply_mask
+    // (run on every tile) sees the right absolute key index. dense: contiguous causal range.
+    const int bs_sel = bs_num_sel(params, blk_coord);
+    const bool block_sparse = (bs_sel >= 0);
+    const int* q2k_base = block_sparse ? bs_base(params, blk_coord) : nullptr;
+    const int mask_trip_count = block_sparse ? bs_sel
+                              : Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size) - swa_trip_start;
+    const int total_trip_count = block_sparse ? bs_sel
+                              : Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size) - swa_trip_start;
     int trip_idx = total_trip_count;
 
     ElementQK row_max = -INFINITY;
     ElementQK row_sum = 0;
 
     Tensor cS_base = make_identity_tensor(select<0,1>(TileShapeQK{}));
-    auto logical_offset = make_coord(
-        get<0>(blk_coord) * get<0>(TileShape{}) + (stage % get<0>(ThreadShape{})) * get<0>(TileShapeQK{}),
-        // SWA: start the K cursor at the first in-window tile so apply_mask sees
-        // the correct absolute key index for the (skipped-start) loaded tiles.
-        swa_trip_start * get<1>(TileShapeQK{}) + (stage % get<1>(ThreadShape{})) * get<1>(TileShapeQK{})
-    );
-    Tensor cS = domain_offset(logical_offset, cS_base);
+    const int q_off = get<0>(blk_coord) * get<0>(TileShape{}) + (stage % get<0>(ThreadShape{})) * get<0>(TileShapeQK{});
+    auto make_cS = [&](int k_tile) {
+      auto logical_offset = make_coord(
+          q_off,
+          k_tile * get<1>(TileShapeQK{}) + (stage % get<1>(ThreadShape{})) * get<1>(TileShapeQK{})
+      );
+      return domain_offset(logical_offset, cS_base);
+    };
 
     pipeline_c.producer_acquire(pipeline_c_producer_state);
-    
+
     constexpr bool NeedMask = !std::is_same_v<Mask, NoMask>;
+
+    // block-sparse: only the diagonal-region K-tiles need the causal mask. A K-tile
+    // (128 keys at k_tile*128) is fully BELOW this stage's first query row q_off when
+    // k_tile < q_off/128 -> all its keys are causal-valid -> skip apply_mask (saves the
+    // per-tile mask cost; the dominant overhead vs the stock dense fwd at low sparsity).
+    // k_tile >= q_off/128 is the diagonal tile (causal edge) or future (fully masked).
+    const int diag_k_tile = q_off / get<1>(TileShapeQK{});
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; trip_idx > 0; trip_idx -= 1) {
+      int cur_iter = total_trip_count - trip_idx;  // 0,1,2,... (block-sparse selected-block index)
+      int k_tile = block_sparse ? q2k_base[cur_iter] : (swa_trip_start + cur_iter);
+      Tensor cS = make_cS(k_tile);
       softmax_step<NeedMask /* need_mask */>(
-          trip_idx <= mask_trip_count,
+          block_sparse ? (k_tile >= diag_k_tile) : (trip_idx <= mask_trip_count),
           row_max, row_sum, stage,
           trip_idx == 1,
           blk_coord, cS, params, problem_shape,
@@ -807,8 +827,6 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
           pipeline_c, pipeline_c_producer_state,
           order_s
       );
-
-      cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
     }
 
     pipeline_c.producer_commit(pipeline_c_producer_state);
@@ -1010,8 +1028,12 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
       CollectiveEpilogue& epilogue) {
 
     // SWA: same windowed count as mma/softmax/load (baseline: unchanged causal count).
-    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size)
-                        - Mask{}.get_trip_start(blk_coord, TileShape{}, problem_shape, params.window_size);
+    // block-sparse: the count is the number of selected K-blocks (correction is
+    // position-agnostic -- it only rescales O -- so only the count must match).
+    int bs_sel = bs_num_sel(params, blk_coord);
+    int mask_tile_count = (bs_sel >= 0) ? bs_sel
+                        : Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size)
+                          - Mask{}.get_trip_start(blk_coord, TileShape{}, problem_shape, params.window_size);
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
 

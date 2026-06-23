@@ -86,4 +86,14 @@ struct SparseAttnBwdParams {
     // Scatter destination descriptor for dV/dK -> dkv at indices[k_pos]
     // (per-row SM90_TMA_REDUCE_ADD_2D issues; standard scatter4 not in atom set).
     CUtensorMap tensor_map_dkv;
+
+    // KV-outer block-sparse (Phase 2b, 576/512): k2q CSR (built host-side from the
+    // per-q-token block selection). At the END of the struct so the existing
+    // positional aggregate-init in sparse_bwd.h leaves them value-initialized
+    // (nullptr/0 => the original per-token Q-outer + atomicAdd-scatter path).
+    // When k2q_row_ptr != nullptr the 576 KV-outer kernel runs (CTA = KV-block,
+    // iterate attending q-tokens via the CSR; contiguous block, accumulate-store).
+    const int* k2q_row_ptr = nullptr;     // [num_kv_blocks + 1]
+    const int* k2q_q_indices = nullptr;   // [s_q * topk_blocks] attending q-token ids per KV-block
+    int num_kv_blocks = 0;
 };
