@@ -219,6 +219,10 @@ struct Sm100BlockSparseFwdMainloopTmaWarpspecialized {
     // SWA: causal sliding-window width. <=0 disables (plain causal). When >0,
     // each query attends only to the last `window_size` keys (q-W < k <= q).
     int window_size = -1;
+
+    // gpt-oss attention sink: per-head [h_q] learnable logit folded into the softmax denominator
+    // (value-less) in-kernel, making O + LSE sink-aware. nullptr disables. Mirrors the dense MLA fwd.
+    const float* sink_bias = nullptr;
   };
 
   struct Params {
@@ -230,6 +234,7 @@ struct Sm100BlockSparseFwdMainloopTmaWarpspecialized {
     float scale_output;
 
     int window_size;
+    const float* sink_bias;
   };
 
   template<class ProblemShape>
@@ -254,7 +259,8 @@ struct Sm100BlockSparseFwdMainloopTmaWarpspecialized {
         args.scale_q * args.scale_k * scale_softmax,
         args.scale_q * args.scale_k * log2_e * scale_softmax,
         args.scale_v * args.inv_scale_o,
-        args.window_size
+        args.window_size,
+        args.sink_bias
     };
   }
 
@@ -754,6 +760,16 @@ struct Sm100BlockSparseFwdMainloopTmaWarpspecialized {
     if (final_call) {
       // re-acquire the S part in the final step
       pipeline_s.consumer_wait(pipeline_s_consumer_state);
+
+      // gpt-oss attention sink: fold a per-head value-less logit into the denominator (mirrors the
+      // dense MLA fwd mainloop). row_sum = sum exp(scale_softmax*(S-row_max)); O-scale =
+      // scale_output/row_sum and LSE = log(row_sum)+scale_softmax*row_max, so adding
+      // exp(sink - scale_softmax*row_max) makes both O and LSE sink-aware. row_max is finite for any
+      // attended row (block-sparse: every kept tile is a selected block; masked-only rows unused).
+      if (params.sink_bias != nullptr && row_max != -INFINITY) {
+        int head = crd2idx(get<2,0>(blk_coord), get<3,0>(problem_shape));
+        row_sum += ::expf(params.sink_bias[head] - params.scale_softmax * row_max);
+      }
 
       Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
       tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;

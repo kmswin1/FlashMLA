@@ -316,6 +316,7 @@ def block_sparse_prefill_bwd(
     window_size: int = -1,
     kv_block_size: int = 128,
     q_block_size: int = 64,
+    attn_sink: Optional[torch.Tensor] = None,
 ):
     """Block-sparse KV-outer MLA prefill backward (sm100, MLA 192/128).
 
@@ -333,21 +334,27 @@ def block_sparse_prefill_bwd(
         window_size: SWA width (<=0 disables); fuses with block-sparse.
         kv_block_size / q_block_size: must be 128 / 64 (== TileShapeK / TileShapeQ).
 
-    Returns: (dq, dk, dv) bf16. (Attention sink is a SWA-only feature, not used here.)
+        attn_sink: optional per-head [h] fp32 gpt-oss sink. dQ/dK/dV are sink-correct via the
+            sink-aware LSE produced by block_sparse_prefill_fwd(attn_sink=...); its own gradient is
+            returned as d_sink. None disables.
+
+    Returns: (dq, dk, dv, d_sink). d_sink is [h] fp32 when attn_sink is given, else None.
     """
     s_q, h, d_qk = q.shape
     d_v = v.shape[-1]
     dq = torch.zeros_like(q)
     dk = torch.zeros_like(k)
     dv = torch.zeros_like(v)
+    # d_sink ([h], fp32) is atomic-accumulated in the (reused dense) sum_OdO pass -> pre-zeroed.
+    d_sink = torch.zeros(h, dtype=torch.float32, device=q.device) if attn_sink is not None else None
     ws_bytes = flash_mla_cuda.block_sparse_bwd_workspace_size(s_q, h, 1, d_qk)
     workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=q.device)
     lse_sh = lse.transpose(0, 1) if lse.shape[0] == h else lse  # -> [s_q, h], stride(0)==1
     flash_mla_cuda.block_sparse_prefill_bwd(
         workspace, do_grad, q, k, v, o, lse_sh, q2k_blocks, dq, dk, dv,
-        sm_scale, window_size, kv_block_size, q_block_size,
+        sm_scale, window_size, kv_block_size, q_block_size, attn_sink, d_sink,
     )
-    return dq, dk, dv
+    return dq, dk, dv, d_sink
 
 
 # The gpt-oss attention sink is implemented entirely in-kernel (no torch/Triton): the
@@ -363,6 +370,7 @@ def block_sparse_prefill_fwd(
     v: torch.Tensor,
     q2k_blocks: torch.Tensor,
     sm_scale: float,
+    attn_sink: Optional[torch.Tensor] = None,
 ):
     """Block-sparse MLA prefill forward (sm100, MLA 192/128 non-absorbed, training).
 
@@ -377,18 +385,18 @@ def block_sparse_prefill_fwd(
         q2k_blocks: [num_q_blocks, topk] int32 -- per-q-block selected KV-block ids
             (-1 pad); num_q_blocks = ceil(s_q / 256). Shared across heads.
         sm_scale: softmax scale (typically 192 ** -0.5).
+        attn_sink: optional per-head [h] fp32 gpt-oss attention sink, folded into the softmax
+            denominator in-kernel (O + LSE sink-aware). None disables (DSA/global layers).
 
-    Returns: (o [s_q, h, 128] bf16, lse [h, s_q] float32, base-e).
-
-    Note: the attention sink is a SWA-only feature (see flash_attn_varlen_func's
-    sink_bias); block-sparse layers do not use it.
+    Returns: (o [s_q, h, 128] bf16, lse [h, s_q] float32, base-e). LSE is sink-aware when attn_sink
+    is given (matches the dense MLA fwd convention), so it pairs directly with block_sparse_prefill_bwd.
     """
     s_q, h, d_qk = q.shape
     d_v = v.shape[-1]
     o = torch.empty(s_q, h, d_v, device=q.device, dtype=q.dtype)
     lse_hs = torch.empty(h, s_q, device=q.device, dtype=torch.float32)  # [h, s_q] contiguous
     lse_sh = lse_hs.transpose(0, 1)  # [s_q, h] view, stride(0)==1 (kernel output layout)
-    flash_mla_cuda.block_sparse_prefill_fwd(q, k, v, o, lse_sh, q2k_blocks, sm_scale)
+    flash_mla_cuda.block_sparse_prefill_fwd(q, k, v, o, lse_sh, q2k_blocks, sm_scale, attn_sink)
     return o, lse_hs
 
 
