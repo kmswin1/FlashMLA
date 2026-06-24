@@ -31,7 +31,9 @@ void block_sparse_prefill_bwd(at::Tensor workspace, at::Tensor d_o, at::Tensor q
                       at::Tensor v, at::Tensor o, at::Tensor lse, at::Tensor q2k_blocks,
                       at::Tensor dq, at::Tensor dk, at::Tensor dv,
                       double softmax_scale, int64_t window_size,
-                      int64_t kv_block_size, int64_t q_block_size) {
+                      int64_t kv_block_size, int64_t q_block_size,
+                      std::optional<at::Tensor> attn_sink,
+                      std::optional<at::Tensor> d_sink) {
   const at::cuda::CUDAGuard device_guard{(char)q.get_device()};
   using Element = cutlass::bfloat16_t;
   using ElementAccumulator = float;
@@ -51,6 +53,11 @@ void block_sparse_prefill_bwd(at::Tensor workspace, at::Tensor d_o, at::Tensor q
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = q.get_device();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+  // gpt-oss attention sink: per-head [h] fp32 logit (sink_ptr) + its gradient output (d_sink_ptr,
+  // [h], pre-zeroed). d_sink folded into the reused dense sum_OdO pass. nullptr disables.
+  const float* sink_ptr = attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr;
+  float* d_sink_ptr = d_sink.has_value() ? d_sink->data_ptr<float>() : nullptr;
 
   ProblemShape problem_shape = cute::make_tuple(Q, K, D, D_VO, cute::make_tuple(H, B));
 
@@ -103,6 +110,7 @@ void block_sparse_prefill_bwd(at::Tensor workspace, at::Tensor d_o, at::Tensor q
     static_cast<ElementAccumulator>(softmax_scale),
     (int)window_size,
     row_ptr.data_ptr<int>(), q_idx.data_ptr<int>(), num_kv_blocks,
+    sink_ptr, d_sink_ptr,   // gpt-oss attention sink (d_sink folded into sum_OdO; nullptr disables)
     hw_info
   };
 

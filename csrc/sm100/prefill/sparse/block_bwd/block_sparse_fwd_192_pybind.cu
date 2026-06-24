@@ -79,7 +79,7 @@ struct BlockSparseFwd192Runner {
       TileScheduler, Sm100MlaFwdCtxKernelWarpspecializedSchedule>>;
 
   void run(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor lse,
-           const int* q2k_ptr, int topk, float scale_softmax) {
+           const int* q2k_ptr, int topk, float scale_softmax, const float* sink_ptr = nullptr) {
     const at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     cutlass::KernelHardwareInfo hw_info;
@@ -132,6 +132,7 @@ struct BlockSparseFwd192Runner {
     arguments.mainloop.load.ptr_q2k = q2k_ptr;
     arguments.mainloop.load.topk = topk;
     arguments.mainloop.window_size = -1;
+    arguments.mainloop.sink_bias = sink_ptr;  // gpt-oss attention sink (nullptr disables in-kernel)
 
     Operation op;
     CUTLASS_CHECK(op.can_implement(arguments));
@@ -144,16 +145,19 @@ struct BlockSparseFwd192Runner {
 // o: [s_q, h, 128] bf16 (out); lse: [s_q, h] fp32 (out, stride(0)==1)
 // q2k: [num_q_blocks, topk] int32, -1 padded (num_q_blocks = ceil(s_q/256))
 void block_sparse_fwd_192(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
-                          at::Tensor lse, at::Tensor q2k, double scale_softmax) {
+                          at::Tensor lse, at::Tensor q2k, double scale_softmax,
+                          std::optional<at::Tensor> attn_sink = std::nullopt) {
   int topk = q2k.size(1);
   int H = q.size(1);
+  // gpt-oss per-head attention sink ([h_q], fp32). nullptr disables (in-kernel fold-in).
+  const float* sink_ptr = attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr;
   // CausalIndividualTileScheduler valid when h is a multiple of its TileH.
   if (H % CausalIndividualTileScheduler::TileH == 0) {
     BlockSparseFwd192Runner</*valid=*/true> runner;
-    runner.run(q, k, v, o, lse, static_cast<const int*>(q2k.data_ptr()), topk, (float)scale_softmax);
+    runner.run(q, k, v, o, lse, static_cast<const int*>(q2k.data_ptr()), topk, (float)scale_softmax, sink_ptr);
   } else {
     BlockSparseFwd192Runner</*valid=*/false> runner;
-    runner.run(q, k, v, o, lse, static_cast<const int*>(q2k.data_ptr()), topk, (float)scale_softmax);
+    runner.run(q, k, v, o, lse, static_cast<const int*>(q2k.data_ptr()), topk, (float)scale_softmax, sink_ptr);
   }
 }
 
@@ -162,8 +166,9 @@ void block_sparse_fwd_192(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o
 // Free function registered in csrc/api/api.cpp (main module). Forwards to the
 // namespaced implementation. Declared in csrc/api/block_sparse_fwd.h.
 void block_sparse_prefill_fwd(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor o,
-                              at::Tensor lse, at::Tensor q2k_blocks, double softmax_scale) {
-  bsfwd192::block_sparse_fwd_192(q, k, v, o, lse, q2k_blocks, softmax_scale);
+                              at::Tensor lse, at::Tensor q2k_blocks, double softmax_scale,
+                              std::optional<at::Tensor> attn_sink) {
+  bsfwd192::block_sparse_fwd_192(q, k, v, o, lse, q2k_blocks, softmax_scale, attn_sink);
 }
 
 #ifdef BLOCK_SPARSE_FWD192_STANDALONE

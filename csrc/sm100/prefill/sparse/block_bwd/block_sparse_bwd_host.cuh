@@ -37,6 +37,12 @@ public:
     const int* k2q_row_ptr = nullptr;
     const int* k2q_q_indices = nullptr;
     int num_kv_blocks = 0;
+    // gpt-oss attention sink: per-head [h_q] logit + its gradient output (zeroed, atomic-accumulated),
+    // folded into the (reused dense) sum_OdO pass: d_sink[h] = -sum_q exp(sink[h]-lse[q,h])*(O.dO)_q.
+    // dQ/dK/dV need no change: the fwd writes a sink-aware LSE, so the bwd's softmax recompute is
+    // already sink-correct (the value-less sink leaves delta = O.dO unchanged). nullptr disables.
+    const ElementAccumulator* sink_bias = nullptr;
+    ElementAccumulator* ptr_d_sink = nullptr;
     cutlass::KernelHardwareInfo hw_info;
   };
 
@@ -73,7 +79,8 @@ private:
     return typename OperationSumOdO::Arguments {
       args.problem_shape, args.ptr_O, args.stride_O, args.ptr_dO, args.stride_dO,
       sum_odo, stride_sum_OdO, args.ptr_LSE, args.stride_LSE,
-      scaled_lse, stride_scaled_lse, -1.0f, -log2_e };
+      scaled_lse, stride_scaled_lse, -1.0f, -log2_e,
+      args.sink_bias, args.ptr_d_sink };  // gpt-oss attention sink: d_sink folded into this pass
   }
 
   static typename OperationConvert::Arguments to_convert_arguments(Arguments const& args, ElementAccumulator* src = nullptr) {
